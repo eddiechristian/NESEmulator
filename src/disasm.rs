@@ -214,3 +214,52 @@ pub fn disassemble(bus: &Bus, start: u16, count: usize) -> Vec<String> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::AddressingMode as Cpu;
+
+    // The CPU's opcode table (opcode.rs) and this one are written separately, so check
+    // every official opcode has the same mnemonic, length and mode in both
+    #[test]
+    fn opcode_table_matches_disassembler() {
+        assert_eq!(ALL_OPCODES.len(), 151);
+        for &(code, name, mode) in ALL_OPCODES {
+            let op = OPCODES_MAP
+                .get(&code)
+                .unwrap_or_else(|| panic!("${:02X} {} missing from opcode.rs", code, name));
+            assert_eq!(op.mnemonic, name, "mnemonic for ${:02X}", code);
+            assert_eq!(
+                op.len as u16,
+                mode.len(),
+                "length for ${:02X} {}",
+                code,
+                name
+            );
+            let same_mode = matches!(
+                (mode, &op.mode),
+                (Mode::Implied, Cpu::NoneAddressing)
+                    | (Mode::Accumulator, Cpu::Accumulator)
+                    | (Mode::Immediate, Cpu::Immediate)
+                    | (Mode::ZeroPage, Cpu::ZeroPage)
+                    | (Mode::ZeroPageX, Cpu::ZeroPage_X)
+                    | (Mode::ZeroPageY, Cpu::ZeroPage_Y)
+                    | (Mode::Absolute, Cpu::Absolute)
+                    | (Mode::AbsoluteX, Cpu::Absolute_X)
+                    | (Mode::AbsoluteY, Cpu::Absolute_Y)
+                    | (Mode::Indirect, Cpu::Indirect)
+                    | (Mode::IndirectX, Cpu::Indirect_X)
+                    | (Mode::IndirectY, Cpu::Indirect_Y)
+                    | (Mode::Relative, Cpu::Relative)
+            );
+            assert!(same_mode, "mode for ${:02X} {}: {:?}", code, name, op.mode);
+            assert!(IMPLEMENTED.contains(&name), "{} not in IMPLEMENTED", name);
+        }
+        assert_eq!(
+            OPCODES_MAP.len(),
+            151,
+            "opcode.rs has entries the disassembler doesn't"
+        );
+    }
+}

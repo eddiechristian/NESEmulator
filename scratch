@@ -12,3 +12,64 @@ In general, for this ROM: file offset = CPU address − 0x8000 + 0x10.
 
 
 xxd -R never -s 0x6DC7 -l 256 DonkeyKong.nes
+
+
+
+=== What's left for Donkey Kong (as of 2026-10-25) ===
+
+Regenerate: python3 tools/missing_ops.py DonkeyKong.nes
+(follows code from the reset/NMI/IRQ vectors, so data isn't counted as code; can't
+follow the JMP ($xxxx) at $E44E, so a few routines may be missing)
+
+Vectors: NMI $EE3F, RESET $EDB7, IRQ $EE8C
+Reachable instructions found: 12029, implemented: 9187, missing: 2842
+Distinct opcodes used: 104, still missing: 60 across 26 mnemonics
+
+Op   Uses  Modes (uses, first address)
+BEQ   655  REL x655 @$8819
+LDY   223  IMM x150 @$89A0, ZP0 x48 @$8A9C, ABX x11 @$924B, ABS x9 @$EF70, ZPX x5 @$A1FC
+ADC   213  IMM x127 @$8D01, ZP0 x52 @$97D8, ABS x19 @$9136, ABY x7 @$D2CD, ABX x5 @$9C29, ZPX x3 @$D706
+CLC   179  IMP x179 @$8B2F
+INY   155  IMP x155 @$89B3
+AND   151  IMM x135 @$87F9, ZP0 x13 @$9915, ZPX x2 @$E82C, ABS x1 @$DC67
+BCS   135  REL x135 @$89DC
+LSR   129  IMP x109 @$90A0, ZP0 x20 @$B0FF
+DEC   122  ZP0 x88 @$894F, ABS x25 @$8865, ABX x5 @$9D62, ZPX x4 @$9ABC
+INC   117  ZP0 x79 @$8B3C, ABS x22 @$9114, ZPX x9 @$9EFB, ABX x7 @$9B03
+SBC   113  IMM x79 @$8BE2, ZP0 x26 @$A046, ABS x4 @$D4B4, ABX x2 @$AEC2, ZPX x2 @$DFAC
+SEC   112  IMP x112 @$8BE1
+BCC   102  REL x102 @$8B37
+ASL    86  IMP x85 @$889D, ZP0 x1 @$E811
+STY    75  ZP0 x44 @$89A2, ABS x29 @$EECA, ZPX x2 @$A01C
+CPX    62  IMM x53 @$8B6E, ZP0 x8 @$9841, ABS x1 @$DC9E
+DEY    40  IMP x40 @$8AA8
+EOR    36  IMM x32 @$880B, ZP0 x2 @$E7D4, ABS x2 @$F686
+CPY    36  IMM x32 @$89B4, ZP0 x4 @$A6F3
+ROL    30  IMP x30 @$CF24
+ORA    28  IMM x24 @$8B48, ZP0 x4 @$B28D
+BMI    25  REL x25 @$888C
+ROR    12  ZP0 x8 @$E7DA, IMP x4 @$F49A
+RTI     3  IMP x3 @$8872
+BIT     2  ABS x1 @$EE3F, ZP0 x1 @$E81F
+BVS     1  REL x1 @$EE42
+
+JMP ($xxxx) at $E44E -- targets not followed, so code behind them may be missing from this list
+1 paths ran into non-opcode bytes (likely data after a jump-table JSR)
+
+Note: IMP on ASL/LSR/ROL/ROR means the accumulator form (ASL A etc.), olc shows it as IMP.
+
+Grouped, roughly easiest first:
+- Branches (one line each via branch()): BEQ BCS BCC BMI BVS
+- Flags: CLC SEC
+- Y register: LDY STY INY DEY CPY  (copy LDX/STX/INX/DEX/CMP)
+- Compare X: CPX  (same as CMP but with X)
+- Logic: AND ORA EOR  (A = A op M, set Z/N)
+- Memory inc/dec: INC DEC  (read-modify-write, set Z/N)
+- Shifts/rotates: ASL LSR ROL ROR  (accumulator and memory forms, set C/Z/N)
+- Arithmetic: ADC SBC  (carry + overflow flag; the trickiest)
+- BIT  (Z from A & M, N and V copied from M bits 7 and 6)
+- RTI  (pull status then PC; needed once NMI is wired up)
+
+
+Update 2026-10-25: all 151 official opcodes are now implemented; missing_ops.py reports 0 missing.
+Donkey Kong now runs until it waits for NMI (spins in the random-number loop at $E7CC), so the next step is the PPU + NMI.

@@ -1,0 +1,4 @@
+[env]
+# rustc once segfaulted (stack overflow) compiling the ttf-parser dependency (pulled in by
+# winit's Wayland decorations) in release mode, and suggested a bigger stack. 32MB.
+RUST_MIN_STACK = "33554432"

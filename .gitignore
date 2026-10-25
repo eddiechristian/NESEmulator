@@ -5,6 +5,9 @@ target/
 *.nes
 *.zip
 
+# CPU logs from --log
+*.log
+
 # Editor / OS clutter
 .vscode/
 .idea/

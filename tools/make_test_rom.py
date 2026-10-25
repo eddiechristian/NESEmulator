@@ -51,8 +51,7 @@ PROGRAM = [
     (None, [0xCA], "DEX"),
     (None, [0x10, ("rel", "loop")], "BPL loop"),
 
-    # Park here forever. LDX #$00 clears N so BPL is always taken. (Branching to the
-    # BPL itself would hit the emulator's "PC unchanged means advance" rule.)
+    # Park here forever. LDX #$00 clears N so BPL is always taken
     ("done", [0xA2, 0x00], "LDX #$00"),
     (None, [0x10, ("rel", "done")], "BPL done"),
 

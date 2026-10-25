@@ -62,6 +62,26 @@ impl Debugger {
         self.next = self.cpu.memory_access(&self.bus);
     }
 
+    // Interrupts push PC and status (3 bytes) onto the stack; show that as the last access
+    fn after_interrupt(&mut self, name: &str) {
+        self.message = format!("{} -> handler at ${:04X}", name, self.cpu.pc);
+        self.last = Some((0x0100 + self.cpu.sp as u16 + 1, 3));
+        self.next = self.cpu.memory_access(&self.bus);
+    }
+
+    fn irq(&mut self) {
+        if self.cpu.irq(&mut self.bus) {
+            self.after_interrupt("IRQ");
+        } else {
+            self.message = "IRQ ignored: I flag is set".to_string();
+        }
+    }
+
+    fn nmi(&mut self) {
+        self.cpu.nmi(&mut self.bus);
+        self.after_interrupt("NMI");
+    }
+
     fn draw(&self, c: &mut Canvas) {
         c.clear(DARK_BLUE);
         self.draw_ram_header(c, 2, 2, 16);
@@ -75,7 +95,7 @@ impl Debugger {
         c.draw_string(
             10,
             380,
-            "SPACE = Step Instruction    R = RESET    ESC = Quit",
+            "SPACE = Step Instruction    R = RESET    I = IRQ    N = NMI    ESC = Quit",
             WHITE,
         );
         c.draw_string(10, 394, "PC", CYAN);
@@ -249,6 +269,8 @@ impl ApplicationHandler for App {
                     Key::Named(NamedKey::Space) => dbg.step(),
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
                     Key::Character(ch) if ch.eq_ignore_ascii_case("r") => dbg.reset(),
+                    Key::Character(ch) if ch.eq_ignore_ascii_case("i") => dbg.irq(),
+                    Key::Character(ch) if ch.eq_ignore_ascii_case("n") => dbg.nmi(),
                     _ => return,
                 }
                 window.request_redraw();
