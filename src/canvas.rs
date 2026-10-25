@@ -8,6 +8,9 @@ pub const WHITE: Rgba = [255, 255, 255, 255];
 pub const GREEN: Rgba = [0, 255, 0, 255];
 pub const RED: Rgba = [255, 0, 0, 255];
 pub const CYAN: Rgba = [0, 255, 255, 255];
+pub const YELLOW: Rgba = [255, 255, 0, 255];
+pub const MAGENTA: Rgba = [255, 0, 255, 255];
+pub const GREY: Rgba = [160, 160, 160, 255];
 
 // An RGBA frame buffer with olcPixelGameEngine-style drawing, ported from pixels_test
 pub struct Canvas<'a> {

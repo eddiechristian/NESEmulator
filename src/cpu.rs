@@ -3,8 +3,11 @@ use std::fmt;
 
 use crate::opcode::{OPCODES_MAP, OpCode};
 
-// Mnemonics that CPU::step has a handler for. Keep in sync with the match in step
-pub const IMPLEMENTED: &[&str] = &["CLD", "SEI", "JSR", "RTS", "LDX", "LDA", "STA", "BPL"];
+// Mnemonics that CPU::execute has a handler for. Keep in sync with the match in execute
+pub const IMPLEMENTED: &[&str] = &[
+    "BPL", "CLD", "CMP", "DEX", "SEI", "JSR", "RTS", "LDX", "LDA", "NOP", "STA", "STX", "TAX",
+    "TAY", "TXS",
+];
 
 const STACK_START: u16 = 0x0100;
 const STACK_END: u16 = 0x01FF;
@@ -79,11 +82,16 @@ impl CPU {
     // Like powering on a real NES: start wherever the reset vector at $FFFC/$FFFD points
     pub fn reset(&mut self, bus: &Bus) {
         self.pc = u16::from_le_bytes([bus.read(0xFFFC), bus.read(0xFFFD)]) as usize;
+        // A real 6502 leaves A/X/Y alone on reset; clearing them (as olcNES does) gives
+        // the debugger a clean start
+        self.reg_a = 0;
+        self.reg_x = 0;
+        self.reg_y = 0;
+        self.total_cycles = 0;
         self.sp = 0xFD;
         self.sr = 0b0010_0100; // interrupt disable set
         // The reset sequence itself takes 7 cycles before the first instruction runs
         self.cycles = 7;
-        println!("reset vector: {:#06x}", self.pc);
     }
 
     // Sets or clears a single status register bit
@@ -153,16 +161,23 @@ impl CPU {
         u16::from_le_bytes([lo, hi])
     }
 
-    // Prints the used part of the stack, from the top (most recent push) down to $01FF
-    pub fn print_stack(&self, bus: &Bus) {
-        println!("--- Stack (SP = {:#04x}) ---", self.sp);
-        let top = STACK_START + self.sp as u16 + 1;
-        if top > STACK_END {
-            println!("  (empty)");
-            return;
-        }
-        for addr in top..=STACK_END {
-            println!("  {:#06x}: {:#04x}", addr, bus.read(addr));
+    // The memory the instruction at PC is about to read or write, as (first address, byte
+    // count), for the debugger. None for instructions that only touch registers, immediates,
+    // and jump/branch targets (those are code, not data). Only peeks at memory, so it's
+    // safe to call between steps while the bus has no read side effects.
+    pub fn memory_access(&self, bus: &Bus) -> Option<(u16, u16)> {
+        let opcode = OPCODES_MAP.get(&bus.read(self.pc as u16))?;
+        let sp = STACK_START + self.sp as u16;
+        match opcode.mnemonic {
+            // JSR pushes the 2-byte return address at SP and SP-1
+            "JSR" => Some((sp - 1, 2)),
+            // RTS pulls 2 bytes starting just above SP
+            "RTS" => Some((sp + 1, 2)),
+            "JMP" => None,
+            _ => match opcode.mode {
+                AddressingMode::NoneAddressing | AddressingMode::Immediate => None,
+                ref mode => Some((self.operand_address(mode, bus).0, 1)),
+            },
         }
     }
 
@@ -213,7 +228,6 @@ impl CPU {
     fn lda(&mut self, mode: &AddressingMode, bus: &Bus) -> u8 {
         let (addr, page_crossed) = self.operand_address(mode, bus);
         let value = bus.read(addr);
-        println!("lda {:?} addr {:#06x} value {:#04x}", mode, addr, value);
         self.reg_a = value;
         self.update_zero_and_negative(value);
         page_crossed as u8
@@ -223,25 +237,54 @@ impl CPU {
     fn ldx(&mut self, mode: &AddressingMode, bus: &Bus) -> u8 {
         let (addr, page_crossed) = self.operand_address(mode, bus);
         let value = bus.read(addr);
-        println!("ldx {:?} addr {:#06x} value {:#04x}", mode, addr, value);
         self.reg_x = value;
         self.update_zero_and_negative(value);
         page_crossed as u8
+    }
+
+    // Compares A with memory by working out A - M without storing it: C is set if A >= M
+    // (unsigned), Z if they're equal, N from bit 7 of the difference.
+    // Returns 1 extra cycle if indexing crossed a page
+    fn cmp(&mut self, mode: &AddressingMode, bus: &Bus) -> u8 {
+        let (addr, page_crossed) = self.operand_address(mode, bus);
+        let value = bus.read(addr);
+        let result = self.reg_a.wrapping_sub(value);
+        self.set_carry(self.reg_a >= value);
+        self.update_zero_and_negative(result);
+        page_crossed as u8
+    }
+
+    // Like STA, no page-crossing penalty (and STX's modes can't cross a page anyway)
+    fn stx(&mut self, mode: &AddressingMode, bus: &mut Bus) {
+        let (addr, _) = self.operand_address(mode, bus);
+        bus.write(addr, self.reg_x);
+    }
+
+    fn txs(&mut self) {
+        self.sp = self.reg_x;
+    }
+
+    // Unlike TXS, transfers into A/X/Y set Z and N from the copied value
+    fn tax(&mut self) {
+        self.reg_x = self.reg_a;
+        self.update_zero_and_negative(self.reg_x);
+    }
+
+    fn tay(&mut self) {
+        self.reg_y = self.reg_a;
+        self.update_zero_and_negative(self.reg_y);
     }
 
     // Stores always take the worst-case time already listed in the opcode table,
     // so a page crossing costs nothing extra
     fn sta(&mut self, mode: &AddressingMode, bus: &mut Bus) {
         let (addr, _) = self.operand_address(mode, bus);
-        println!("sta {:?} addr {:#06x}", mode, addr);
-
-        // Print before modification
-        println!("Memory at {:#06x} BEFORE: {:#04x}", addr, bus.read(addr));
-
         bus.write(addr, self.reg_a);
+    }
 
-        // Print after modification
-        println!("Memory at {:#06x} AFTER:  {:#04x}", addr, bus.read(addr));
+    fn dex(&mut self) {
+        self.reg_x = self.reg_x.wrapping_sub(1);
+        self.update_zero_and_negative(self.reg_x);
     }
 
     // Branch operand is a signed offset from the next instruction (PC + 2).
@@ -250,10 +293,7 @@ impl CPU {
         let offset = bus.read(self.pc as u16 + 1) as i8;
         let next = (self.pc as u16).wrapping_add(2);
         let target = next.wrapping_add(offset as u16);
-        println!(
-            "branch offset {} to {:#06x}, taken: {}",
-            offset, target, condition
-        );
+
         if !condition {
             return 0;
         }
@@ -268,23 +308,18 @@ impl CPU {
     fn jsr(&mut self, operands: &[u8], bus: &mut Bus) {
         // JSR pushes the address of its own last byte (PC + 2), not the next instruction;
         // RTS adds 1 after pulling it
-        self.print_stack(bus);
+
         let return_addr = (self.pc + 2) as u16;
         self.pushw(bus, return_addr);
 
-        self.print_stack(bus);
         // Operand is a little-endian absolute address
         let target = u16::from_le_bytes([operands[0], operands[1]]);
-        println!("jsr to {:#06x}, return addr {:#06x}", target, return_addr);
         self.pc = target as usize;
     }
 
     fn rts(&mut self, bus: &Bus) {
-        self.print_stack(bus);
         // JSR pushed the address of its own last byte, so add 1 to land on the next instruction
         let return_addr = self.popw(bus).wrapping_add(1);
-        self.print_stack(bus);
-        println!("rts to {:#06x}", return_addr);
         self.pc = return_addr as usize;
     }
 
@@ -317,7 +352,6 @@ impl CPU {
                     break;
                 }
             }
-            println!("{:#X}", self);
         }
     }
 
@@ -328,15 +362,16 @@ impl CPU {
         let opcode = OPCODES_MAP
             .get(&code)
             .unwrap_or_else(|| panic!("OpCode {:x} is not recognized", code));
-        println!(
-            "opcode  code:{:#04x} len: {} cycles: {}",
-            opcode.code, opcode.len, opcode.cycles
-        );
         let pc_before = self.pc;
 
         let extra_cycles = match opcode.mnemonic {
             "CLD" => {
                 self.set_decimal(false);
+                0
+            }
+            "CMP" => self.cmp(&opcode.mode, bus),
+            "DEX" => {
+                self.dex();
                 0
             }
             "SEI" => {
@@ -356,14 +391,31 @@ impl CPU {
             }
             "LDX" => self.ldx(&opcode.mode, bus),
             "LDA" => self.lda(&opcode.mode, bus),
+            "NOP" => 0,
             "STA" => {
                 self.sta(&opcode.mode, bus);
+                0
+            }
+            "STX" => {
+                self.stx(&opcode.mode, bus);
+                0
+            }
+            "TAX" => {
+                self.tax();
+                0
+            }
+            "TAY" => {
+                self.tay();
+                0
+            }
+            "TXS" => {
+                self.txs();
                 0
             }
             "BPL" => self.branch(self.sr & FLAG_NEGATIVE == 0, bus),
             _ => {
                 eprintln!("no mneumic");
-                0
+                panic!("no mneumic");
             }
         };
         // Only advance if the instruction didn't jump
@@ -403,6 +455,113 @@ mod tests {
     #[test]
     fn sta_absolute_x_page_crossed_has_no_penalty() {
         assert_eq!(cycles_for(&[0x9d, 0xff, 0x10], |c| c.reg_x = 1), 5);
+    }
+
+    #[test]
+    fn stx_writes_x_to_each_mode() {
+        // (program, X, Y, expected address, expected cycles)
+        let cases: [(&[u8], u8, u8, u16, u64); 4] = [
+            (&[0x86, 0x10], 0x42, 0, 0x0010, 3),       // STX $10
+            (&[0x96, 0x10], 0x42, 0x05, 0x0015, 4),    // STX $10,Y
+            (&[0x96, 0xff], 0x42, 0x02, 0x0001, 4),    // STX $FF,Y wraps within page zero
+            (&[0x8e, 0x00, 0x20], 0x42, 0, 0x2000, 4), // STX $2000
+        ];
+        for (program, x, y, addr, cycles) in cases {
+            let mut bus = Bus::new();
+            bus.load(0x0600, program);
+            let mut cpu = CPU::new();
+            cpu.reg_x = x;
+            cpu.reg_y = y;
+            cpu.step(1, &mut bus);
+            assert_eq!(bus.read(addr), x, "program {:02X?}", program);
+            assert_eq!(cpu.total_cycles, cycles, "program {:02X?}", program);
+            assert_eq!(cpu.pc, 0x0600 + program.len(), "program {:02X?}", program);
+        }
+    }
+
+    #[test]
+    fn memory_access_reports_what_the_next_instruction_touches() {
+        let access = |program: &[u8]| {
+            let mut bus = Bus::new();
+            bus.load(0x0600, program);
+            let mut cpu = CPU::new();
+            cpu.sp = 0xFD;
+            cpu.reg_x = 2;
+            cpu.memory_access(&bus)
+        };
+        assert_eq!(access(&[0xad, 0x02, 0x20]), Some((0x2002, 1))); // LDA $2002
+        assert_eq!(access(&[0x95, 0x10]), Some((0x0012, 1))); // STA $10,X
+        assert_eq!(access(&[0x20, 0x00, 0x80]), Some((0x01FC, 2))); // JSR pushes at SP, SP-1
+        assert_eq!(access(&[0x60]), Some((0x01FE, 2))); // RTS pulls from SP+1, SP+2
+        assert_eq!(access(&[0xa9, 0x01]), None); // LDA #$01
+        assert_eq!(access(&[0xca]), None); // DEX
+        assert_eq!(access(&[0x10, 0x02]), None); // BPL
+    }
+
+    #[test]
+    fn cmp_sets_carry_zero_and_negative() {
+        // (A, M, expected C, Z, N)
+        let cases = [
+            (0x05, 0x03, true, false, false), // A > M
+            (0x05, 0x05, true, true, false),  // A == M
+            (0x01, 0x02, false, false, true), // A < M, difference $FF
+            (0x00, 0x80, false, false, true), // difference $80
+            (0x80, 0x00, true, false, true),  // A > M but difference has bit 7 set
+            (0xFF, 0x01, true, false, true),  // unsigned: $FF is greater than $01
+        ];
+        for (a, m, c, z, n) in cases {
+            let mut bus = Bus::new();
+            bus.load(0x0600, &[0xc9, m]); // CMP #m
+            let mut cpu = CPU::new();
+            cpu.reg_a = a;
+            // Start with every flag set the opposite way, so stale flags would show up
+            cpu.set_carry(!c);
+            cpu.set_zero(!z);
+            cpu.set_negative(!n);
+            cpu.step(1, &mut bus);
+            let ctx = format!("CMP A=${:02X} M=${:02X}", a, m);
+            assert_eq!(cpu.sr & FLAG_CARRY != 0, c, "C after {}", ctx);
+            assert_eq!(cpu.sr & FLAG_ZERO != 0, z, "Z after {}", ctx);
+            assert_eq!(cpu.sr & FLAG_NEGATIVE != 0, n, "N after {}", ctx);
+            assert_eq!(cpu.reg_a, a, "A must be unchanged after {}", ctx);
+        }
+    }
+
+    #[test]
+    fn cmp_absolute_x_page_crossed() {
+        // CMP $10FF,X with X = 1 reads $1100: 4 + 1 cycles
+        assert_eq!(cycles_for(&[0xdd, 0xff, 0x10], |c| c.reg_x = 1), 5);
+    }
+
+    #[test]
+    fn tax_and_tay_copy_a_and_set_flags() {
+        // (opcode, A, expected Z, N)
+        let cases = [
+            (0xaa, 0x42, false, false), // TAX
+            (0xaa, 0x00, true, false),
+            (0xaa, 0x80, false, true),
+            (0xa8, 0x42, false, false), // TAY
+            (0xa8, 0x00, true, false),
+            (0xa8, 0x80, false, true),
+        ];
+        for (code, a, z, n) in cases {
+            let mut bus = Bus::new();
+            bus.load(0x0600, &[code]);
+            let mut cpu = CPU::new();
+            cpu.reg_a = a;
+            // Opposite flags first, so a missing flag update fails the test
+            cpu.set_zero(!z);
+            cpu.set_negative(!n);
+            cpu.step(1, &mut bus);
+            let ctx = format!("opcode ${:02X} with A=${:02X}", code, a);
+            let target = if code == 0xaa { cpu.reg_x } else { cpu.reg_y };
+            assert_eq!(target, a, "{}", ctx);
+            assert_eq!(cpu.reg_a, a, "A must be unchanged after {}", ctx);
+            assert_eq!(cpu.sr & FLAG_ZERO != 0, z, "Z after {}", ctx);
+            assert_eq!(cpu.sr & FLAG_NEGATIVE != 0, n, "N after {}", ctx);
+            assert_eq!(cpu.total_cycles, 2, "cycles for {}", ctx);
+            assert_eq!(cpu.pc, 0x0601, "PC after {}", ctx);
+        }
     }
 
     #[test]

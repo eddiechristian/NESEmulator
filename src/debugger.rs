@@ -10,7 +10,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::bus::Bus;
-use crate::canvas::{CYAN, Canvas, DARK_BLUE, GREEN, RED, Rgba, WHITE};
+use crate::canvas::{CYAN, Canvas, DARK_BLUE, GREEN, GREY, MAGENTA, RED, Rgba, WHITE, YELLOW};
 use crate::cpu::{self, CPU};
 use crate::disasm;
 use crate::font;
@@ -29,6 +29,11 @@ struct Debugger {
     font: Vec<bool>,
     // Shown above the key help, e.g. when stepping hits a missing instruction
     message: String,
+    // Memory accesses as (address, byte count). `last` is what the most recently stepped
+    // instruction touched (kept until another one touches memory), `next` is what the
+    // instruction at PC is about to touch
+    last: Option<(u16, u16)>,
+    next: Option<(u16, u16)>,
 }
 
 impl Debugger {
@@ -42,38 +47,94 @@ impl Debugger {
             return;
         }
         self.message.clear();
+        // Has to be worked out before stepping, while PC is still on this instruction
+        if self.next.is_some() {
+            self.last = self.next;
+        }
         self.cpu.step(1, &mut self.bus);
+        self.next = self.cpu.memory_access(&self.bus);
     }
 
     fn reset(&mut self) {
         self.message.clear();
         self.cpu.reset(&self.bus);
+        self.last = None;
+        self.next = self.cpu.memory_access(&self.bus);
     }
 
     fn draw(&self, c: &mut Canvas) {
         c.clear(DARK_BLUE);
-        self.draw_ram(c, 2, 2, 0x0000, 16, 16);
+        self.draw_ram_header(c, 2, 2, 16);
+        self.draw_accesses(c, 2, 12);
         // Second page follows PC, so the code being run is always visible
-        self.draw_ram(c, 2, 182, self.cpu.pc as u16 & 0xFF00, 16, 16);
+        self.draw_ram_header(c, 2, 182, 16);
+        self.draw_ram(c, 2, 192, self.cpu.pc as u16 & 0xFF00, 16, 16);
         self.draw_cpu(c, 448, 2);
         self.draw_code(c, 448, 82);
-        c.draw_string(10, 350, &self.message, RED);
+        c.draw_string(10, 366, &self.message, RED);
         c.draw_string(
             10,
-            370,
+            380,
             "SPACE = Step Instruction    R = RESET    ESC = Quit",
             WHITE,
         );
+        c.draw_string(10, 394, "PC", CYAN);
+        c.draw_string(40, 394, "Last access", YELLOW);
+        c.draw_string(144, 394, "Next access", MAGENTA);
     }
 
+    // Column offsets (00..0F) above a hex dump, lined up with the bytes in draw_ram
+    fn draw_ram_header(&self, c: &mut Canvas, x: i32, y: i32, cols: u16) {
+        for col in 0..cols {
+            let byte_x = x + (6 + col as i32 * 3) * 8;
+            c.draw_string(byte_x, y, &format!(" {:02X}", col), GREY);
+        }
+    }
+
+    // Top 16 rows of RAM. One full page when the last and next accesses share a page (or
+    // only one exists; page zero before anything is accessed). When they're on different
+    // pages, the half-page (8 rows) around each instead: last on top, next below
+    fn draw_accesses(&self, c: &mut Canvas, x: i32, y: i32) {
+        let page = |(addr, _): (u16, u16)| addr & 0xFF00;
+        let half = |(addr, _): (u16, u16)| addr & 0xFF80;
+        match (self.last, self.next) {
+            (Some(last), Some(next)) if page(last) != page(next) => {
+                self.draw_ram(c, x, y, half(last), 8, 16);
+                self.draw_ram(c, x, y + 80, half(next), 8, 16);
+            }
+            (Some(access), _) | (None, Some(access)) => {
+                self.draw_ram(c, x, y, page(access), 16, 16)
+            }
+            (None, None) => self.draw_ram(c, x, y, 0x0000, 16, 16),
+        }
+    }
+
+    // Hex dump in olc's layout ("$0000: 00 01 ..."). Bytes of the instruction at PC
+    // are drawn in cyan, the last memory access in yellow and the next one in magenta
     fn draw_ram(&self, c: &mut Canvas, x: i32, y: i32, addr: u16, rows: u16, cols: u16) {
+        let pc = self.cpu.pc as u16;
+        let len = disasm::decode(&self.bus, pc).len;
+        let in_range = |a: u16, start: u16, len: u16| a.wrapping_sub(start) < len;
+
         for row in 0..rows {
             let start = addr.wrapping_add(row * cols);
-            let mut line = format!("${:04X}:", start);
+            let row_y = y + row as i32 * 10;
+            c.draw_string(x, row_y, &format!("${:04X}:", start), WHITE);
             for col in 0..cols {
-                line += &format!(" {:02X}", self.bus.read(start.wrapping_add(col)));
+                let a = start.wrapping_add(col);
+                let colour = if in_range(a, pc, len) {
+                    CYAN
+                } else if self.last.is_some_and(|(w, n)| in_range(a, w, n)) {
+                    YELLOW
+                } else if self.next.is_some_and(|(w, n)| in_range(a, w, n)) {
+                    MAGENTA
+                } else {
+                    WHITE
+                };
+                // Each byte is " XX" after the 6-char "$XXXX:" prefix, 8px per char
+                let byte_x = x + (6 + col as i32 * 3) * 8;
+                c.draw_string(byte_x, row_y, &format!(" {:02X}", self.bus.read(a)), colour);
             }
-            c.draw_string(x, y + row as i32 * 10, &line, WHITE);
         }
     }
 
@@ -211,13 +272,17 @@ impl ApplicationHandler for App {
 
 // Opens the debugger window and runs until it's closed
 pub fn run(cpu: CPU, bus: Bus) {
+    let mut debugger = Debugger {
+        cpu,
+        bus,
+        font: font::build_sheet(),
+        message: String::new(),
+        last: None,
+        next: None,
+    };
+    debugger.next = debugger.cpu.memory_access(&debugger.bus);
     let mut app = App {
-        debugger: Some(Debugger {
-            cpu,
-            bus,
-            font: font::build_sheet(),
-            message: String::new(),
-        }),
+        debugger: Some(debugger),
         ..Default::default()
     };
     let event_loop = EventLoop::new().expect("create event loop");
