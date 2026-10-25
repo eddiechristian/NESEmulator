@@ -1,1 +1,13 @@
-/target
+# Rust build output (root crate and pixels_test)
+target/
+
+# ROMs: commercial, keep local only
+*.nes
+*.zip
+
+# Editor / OS clutter
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

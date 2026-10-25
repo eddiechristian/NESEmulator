@@ -1,0 +1,9 @@
+[package]
+name = "pixels_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fontdue = "0.9.5"
+pixels = "0.17.2"
+winit = "0.30"

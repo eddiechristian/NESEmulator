@@ -1,0 +1,14 @@
+cargo run -- --disasm DonkeyKong.nes 28 EDB7
+
+
+
+How I got the offset:
+
+- Header: the first 16 bytes are 4E 45 53 1A 02 02 31 00. That means 2 PRG banks (32KB) of program code, 2 CHR banks, mapper 3 (CNROM) and no trainer. So the program code starts at file offset 0x10 and is mapped to CPU $8000–$FFFF.
+- Reset vector: this is the address the CPU jumps to on power-up. It's stored at CPU $FFFC, which is file offset 0x10 + (0xFFFC − 0x8000) = 0x800C. Those bytes are B7 ED, so the entry point is $EDB7.
+- Entry point in the file: 0x10 + (0xEDB7 − 0x8000) = 0x6DC7.
+
+In general, for this ROM: file offset = CPU address − 0x8000 + 0x10.
+
+
+xxd -R never -s 0x6DC7 -l 256 DonkeyKong.nes

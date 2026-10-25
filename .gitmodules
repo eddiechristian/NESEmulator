@@ -1,0 +1,4 @@
+[submodule "olcNES"]
+	path = olcNES
+	url = https://github.com/OneLoneCoder/olcNES.git
+	ignore = untracked
