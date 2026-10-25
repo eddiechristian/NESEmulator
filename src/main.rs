@@ -1,6 +1,9 @@
 mod bus;
+mod canvas;
 mod cpu;
+mod debugger;
 mod disasm;
+mod font;
 mod opcode;
 mod rom;
 
@@ -46,12 +49,14 @@ fn main() {
                 cpu.pc as u16
             }
         };
-        disasm::disassemble(&bus, start, count);
+        for line in disasm::disassemble(&bus, start, count) {
+            println!("{}", line);
+        }
         return;
     }
 
     // Usage: cargo run -- path/to/game.nes
-    // With no argument, run the dummy program instead
+    // Opens the CPU debugger window. With no argument, loads the dummy program instead
     match env::args().nth(1) {
         Some(path) => {
             let rom = Rom::from_file(&path).unwrap_or_else(|e| {
@@ -62,10 +67,6 @@ fn main() {
 
             //temporary hack until we get PPU.
             bus.write(0x2002, 0x80);
-
-            cpu.reset(&bus);
-            println!("begin {:#X}", cpu);
-            bus.print_range(cpu.pc as u16, 16);
         }
         None => {
             // Load some dummy program code
@@ -75,10 +76,11 @@ fn main() {
             ];
             bus.load(0x0600, &program_code);
 
-            // Option B: Print a sequence/range of memory
-            bus.print_range(0x0600, 16);
+            // Point the reset vector at it so R in the debugger restarts it
+            bus.load(0xFFFC, &[0x00, 0x06]);
         }
     }
 
-    cpu.step(5, &mut bus);
+    cpu.reset(&bus);
+    debugger::run(cpu, bus);
 }

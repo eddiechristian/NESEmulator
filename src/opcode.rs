@@ -1,6 +1,8 @@
 use crate::cpu::AddressingMode;
 use std::collections::HashMap;
 
+// `cycles` is the base cost. Instructions marked "+1 if page crossed" (indexed reads)
+// and branches report their extra cycles from their handler in cpu.rs
 pub struct OpCode {
     pub code: u8,
     pub mnemonic: &'static str,
@@ -12,11 +14,11 @@ pub struct OpCode {
 impl OpCode {
     fn new(code: u8, mnemonic: &'static str, len: u8, cycles: u8, mode: AddressingMode) -> Self {
         OpCode {
-            code: code,
-            mnemonic: mnemonic,
-            len: len,
-            cycles: cycles,
-            mode: mode,
+            code,
+            mnemonic,
+            len,
+            cycles,
+            mode,
         }
     }
 }
@@ -24,7 +26,7 @@ impl OpCode {
 lazy_static! {
     pub static ref CPU_OPS_CODES: Vec<OpCode> = vec![
         OpCode::new(0x00, "BRK", 1, 7, AddressingMode::NoneAddressing),
-        OpCode::new(0x10, "BPL", 2, 2/*+1 if taken, +2 if page crossed*/, AddressingMode::NoneAddressing),
+        OpCode::new(0x10, "BPL", 2, 2/*+1 if taken, +1 more if page crossed*/, AddressingMode::NoneAddressing),
         OpCode::new(0xd8, "CLD", 1, 2, AddressingMode::NoneAddressing),
         OpCode::new(0xe8, "INX", 1, 2, AddressingMode::NoneAddressing),
         OpCode::new(0x20, "JSR", 3, 6, AddressingMode::Absolute),

@@ -10,14 +10,14 @@ const STACK_START: u16 = 0x0100;
 const STACK_END: u16 = 0x01FF;
 
 // Status register bits: NV-B DIZC
-const FLAG_CARRY: u8 = 0b0000_0001;
-const FLAG_ZERO: u8 = 0b0000_0010;
-const FLAG_INTERRUPT_DISABLE: u8 = 0b0000_0100;
-const FLAG_DECIMAL: u8 = 0b0000_1000;
-const FLAG_BREAK: u8 = 0b0001_0000;
-const FLAG_UNUSED: u8 = 0b0010_0000;
-const FLAG_OVERFLOW: u8 = 0b0100_0000;
-const FLAG_NEGATIVE: u8 = 0b1000_0000;
+pub const FLAG_CARRY: u8 = 0b0000_0001;
+pub const FLAG_ZERO: u8 = 0b0000_0010;
+pub const FLAG_INTERRUPT_DISABLE: u8 = 0b0000_0100;
+pub const FLAG_DECIMAL: u8 = 0b0000_1000;
+pub const FLAG_BREAK: u8 = 0b0001_0000;
+pub const FLAG_UNUSED: u8 = 0b0010_0000;
+pub const FLAG_OVERFLOW: u8 = 0b0100_0000;
+pub const FLAG_NEGATIVE: u8 = 0b1000_0000;
 
 #[derive(Debug)]
 #[allow(non_camel_case_types)]
@@ -41,6 +41,10 @@ pub struct CPU {
     pub sp: u8,
     pub pc: usize,
     pub sr: u8,
+    // Cycles left before the current instruction finishes; clock() fetches the next one at 0
+    pub cycles: u8,
+    // Cycles since power-on, handy for comparing against nestest-style logs
+    pub total_cycles: u64,
 }
 
 impl fmt::UpperHex for CPU {
@@ -53,6 +57,7 @@ impl fmt::UpperHex for CPU {
             // PC is a usize, so 4 hex digits (0x0000) fits typical 16-bit emulators
             .field("pc", &format_args!("0x{:04x}", self.pc))
             .field("sr", &format_args!("b{:08b}", self.sr))
+            .field("total_cycles", &self.total_cycles)
             .finish()
     }
 }
@@ -66,6 +71,8 @@ impl CPU {
             sp: 0xFF,
             pc: 0x0600,
             sr: 0b0011_0000,
+            cycles: 0,
+            total_cycles: 0,
         }
     }
 
@@ -74,6 +81,8 @@ impl CPU {
         self.pc = u16::from_le_bytes([bus.read(0xFFFC), bus.read(0xFFFD)]) as usize;
         self.sp = 0xFD;
         self.sr = 0b0010_0100; // interrupt disable set
+        // The reset sequence itself takes 7 cycles before the first instruction runs
+        self.cycles = 7;
         println!("reset vector: {:#06x}", self.pc);
     }
 
@@ -157,10 +166,11 @@ impl CPU {
         }
     }
 
-
     // Works out the effective address an instruction's operand refers to.
     // For Immediate, that's the operand byte itself (PC + 1).
-    fn operand_address(&self, mode: &AddressingMode, bus: &Bus) -> u16 {
+    // Also returns whether indexing crossed into a new page, which costs read
+    // instructions an extra cycle in the Absolute_X/Y and Indirect_Y modes.
+    fn operand_address(&self, mode: &AddressingMode, bus: &Bus) -> (u16, bool) {
         let arg = bus.read(self.pc as u16 + 1);
         // Reads a little-endian pointer from page zero; the high byte wraps within page zero
         let zp_word = |ptr: u8| {
@@ -168,19 +178,25 @@ impl CPU {
         };
         let abs = || u16::from_le_bytes([arg, bus.read(self.pc as u16 + 2)]);
 
+        // Adds an index to a base address and reports whether the high byte changed
+        let indexed = |base: u16, index: u8| {
+            let addr = base.wrapping_add(index as u16);
+            (addr, addr & 0xFF00 != base & 0xFF00)
+        };
+
         match mode {
-            AddressingMode::Immediate => self.pc as u16 + 1,
-            AddressingMode::ZeroPage => arg as u16,
+            AddressingMode::Immediate => (self.pc as u16 + 1, false),
+            AddressingMode::ZeroPage => (arg as u16, false),
             // Zero page indexed addresses wrap within page zero
-            AddressingMode::ZeroPage_X => arg.wrapping_add(self.reg_x) as u16,
-            AddressingMode::ZeroPage_Y => arg.wrapping_add(self.reg_y) as u16,
-            AddressingMode::Absolute => abs(),
-            AddressingMode::Absolute_X => abs().wrapping_add(self.reg_x as u16),
-            AddressingMode::Absolute_Y => abs().wrapping_add(self.reg_y as u16),
+            AddressingMode::ZeroPage_X => (arg.wrapping_add(self.reg_x) as u16, false),
+            AddressingMode::ZeroPage_Y => (arg.wrapping_add(self.reg_y) as u16, false),
+            AddressingMode::Absolute => (abs(), false),
+            AddressingMode::Absolute_X => indexed(abs(), self.reg_x),
+            AddressingMode::Absolute_Y => indexed(abs(), self.reg_y),
             // (zp,X): add X to the zero page address first, then read the pointer there
-            AddressingMode::Indirect_X => zp_word(arg.wrapping_add(self.reg_x)),
+            AddressingMode::Indirect_X => (zp_word(arg.wrapping_add(self.reg_x)), false),
             // (zp),Y: read the pointer from zero page first, then add Y to it
-            AddressingMode::Indirect_Y => zp_word(arg).wrapping_add(self.reg_y as u16),
+            AddressingMode::Indirect_Y => indexed(zp_word(arg), self.reg_y),
             AddressingMode::NoneAddressing => {
                 panic!("mode {:?} has no operand address", mode)
             }
@@ -193,24 +209,30 @@ impl CPU {
         self.set_negative(result & 0x80 != 0);
     }
 
-    fn lda(&mut self, mode: &AddressingMode, bus: &Bus) {
-        let addr = self.operand_address(mode, bus);
+    // Returns 1 extra cycle if indexing crossed a page
+    fn lda(&mut self, mode: &AddressingMode, bus: &Bus) -> u8 {
+        let (addr, page_crossed) = self.operand_address(mode, bus);
         let value = bus.read(addr);
         println!("lda {:?} addr {:#06x} value {:#04x}", mode, addr, value);
         self.reg_a = value;
         self.update_zero_and_negative(value);
+        page_crossed as u8
     }
 
-    fn ldx(&mut self, mode: &AddressingMode, bus: &Bus) {
-        let addr = self.operand_address(mode, bus);
+    // Returns 1 extra cycle if indexing crossed a page
+    fn ldx(&mut self, mode: &AddressingMode, bus: &Bus) -> u8 {
+        let (addr, page_crossed) = self.operand_address(mode, bus);
         let value = bus.read(addr);
         println!("ldx {:?} addr {:#06x} value {:#04x}", mode, addr, value);
         self.reg_x = value;
         self.update_zero_and_negative(value);
+        page_crossed as u8
     }
 
+    // Stores always take the worst-case time already listed in the opcode table,
+    // so a page crossing costs nothing extra
     fn sta(&mut self, mode: &AddressingMode, bus: &mut Bus) {
-        let addr = self.operand_address(mode, bus);
+        let (addr, _) = self.operand_address(mode, bus);
         println!("sta {:?} addr {:#06x}", mode, addr);
 
         // Print before modification
@@ -222,13 +244,24 @@ impl CPU {
         println!("Memory at {:#06x} AFTER:  {:#04x}", addr, bus.read(addr));
     }
 
-    // Branch operand is a signed offset from the next instruction (PC + 2)
-    fn branch(&mut self, condition: bool, bus: &Bus) {
+    // Branch operand is a signed offset from the next instruction (PC + 2).
+    // Returns the extra cycles: +1 if taken, +1 more if the target is on a different page
+    fn branch(&mut self, condition: bool, bus: &Bus) -> u8 {
         let offset = bus.read(self.pc as u16 + 1) as i8;
-        let target = (self.pc as u16).wrapping_add(2).wrapping_add(offset as u16);
-        println!("branch offset {} to {:#06x}, taken: {}", offset, target, condition);
-        if condition {
-            self.pc = target as usize;
+        let next = (self.pc as u16).wrapping_add(2);
+        let target = next.wrapping_add(offset as u16);
+        println!(
+            "branch offset {} to {:#06x}, taken: {}",
+            offset, target, condition
+        );
+        if !condition {
+            return 0;
+        }
+        self.pc = target as usize;
+        if target & 0xFF00 != next & 0xFF00 {
+            2
+        } else {
+            1
         }
     }
 
@@ -255,52 +288,148 @@ impl CPU {
         self.pc = return_addr as usize;
     }
 
-    pub fn step(&mut self, steps: usize, bus: &mut Bus) {
-        for i in 0..steps {
-            let code = bus.read(self.pc as u16);
-            let opcode = OPCODES_MAP
-                .get(&code)
-                .expect(&format!("OpCode {:x} is not recognized", code));
-            println!("opcode  code:{:#04x} len: {}", opcode.code, opcode.len);
-            let pc_before = self.pc;
+    // Advances the CPU by one clock cycle. Like olcNES, the whole instruction runs on its
+    // first cycle and the remaining cycles are just counted down, so devices clocked
+    // alongside the CPU still see it take the right amount of time.
+    pub fn clock(&mut self, bus: &mut Bus) {
+        if self.cycles == 0 {
+            self.cycles = self.execute(bus);
+        }
+        self.cycles -= 1;
+        self.total_cycles += 1;
+    }
 
-            match opcode.mnemonic {
-                "CLD" => {
-                    self.set_decimal(false);
-                }
-                "SEI" => {
-                    self.set_interrupt_disable(true);
-                }
-                "JSR" => {
-                    let operands: Vec<u8> = (1..opcode.len as u16)
-                        .map(|i| bus.read(self.pc as u16 + i))
-                        .collect();
-                    self.jsr(&operands, bus);
-                }
-                "RTS" => {
-                    self.rts(bus);
-                }
-                "LDX" => {
-                    self.ldx(&opcode.mode, bus);
-                }
-                "LDA" => {
-                    self.lda(&opcode.mode, bus);
-                }
-                "STA" => {
-                    self.sta(&opcode.mode, bus);
-                }
-                "BPL" => {
-                    self.branch(self.sr & FLAG_NEGATIVE == 0, bus);
-                }
-                _ => {
-                    eprintln!("no mneumic")
-                }
+    // True when the current instruction has used up all its cycles
+    pub fn complete(&self) -> bool {
+        self.cycles == 0
+    }
+
+    // Runs `steps` whole instructions, clocking through each one's cycles
+    pub fn step(&mut self, steps: usize, bus: &mut Bus) {
+        for _ in 0..steps {
+            // Finish anything already in flight (e.g. the reset sequence) first
+            while !self.complete() {
+                self.clock(bus);
             }
-            // Only advance if the instruction didn't jump
-            if self.pc == pc_before {
-                self.pc += opcode.len as usize;
+            loop {
+                self.clock(bus);
+                if self.complete() {
+                    break;
+                }
             }
             println!("{:#X}", self);
         }
+    }
+
+    // Runs one instruction and returns how many cycles it takes: the base count from
+    // the opcode table plus any extra the handler reports
+    fn execute(&mut self, bus: &mut Bus) -> u8 {
+        let code = bus.read(self.pc as u16);
+        let opcode = OPCODES_MAP
+            .get(&code)
+            .unwrap_or_else(|| panic!("OpCode {:x} is not recognized", code));
+        println!(
+            "opcode  code:{:#04x} len: {} cycles: {}",
+            opcode.code, opcode.len, opcode.cycles
+        );
+        let pc_before = self.pc;
+
+        let extra_cycles = match opcode.mnemonic {
+            "CLD" => {
+                self.set_decimal(false);
+                0
+            }
+            "SEI" => {
+                self.set_interrupt_disable(true);
+                0
+            }
+            "JSR" => {
+                let operands: Vec<u8> = (1..opcode.len as u16)
+                    .map(|i| bus.read(self.pc as u16 + i))
+                    .collect();
+                self.jsr(&operands, bus);
+                0
+            }
+            "RTS" => {
+                self.rts(bus);
+                0
+            }
+            "LDX" => self.ldx(&opcode.mode, bus),
+            "LDA" => self.lda(&opcode.mode, bus),
+            "STA" => {
+                self.sta(&opcode.mode, bus);
+                0
+            }
+            "BPL" => self.branch(self.sr & FLAG_NEGATIVE == 0, bus),
+            _ => {
+                eprintln!("no mneumic");
+                0
+            }
+        };
+        // Only advance if the instruction didn't jump
+        if self.pc == pc_before {
+            self.pc += opcode.len as usize;
+        }
+        opcode.cycles + extra_cycles
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Loads `program` at $0600, runs one instruction and returns the cycles it took
+    fn cycles_for(program: &[u8], setup: impl FnOnce(&mut CPU)) -> u64 {
+        let mut bus = Bus::new();
+        bus.load(0x0600, program);
+        let mut cpu = CPU::new();
+        setup(&mut cpu);
+        cpu.step(1, &mut bus);
+        cpu.total_cycles
+    }
+
+    #[test]
+    fn lda_absolute_x_same_page() {
+        // LDA $1000,X with X = 1 stays on page $10
+        assert_eq!(cycles_for(&[0xbd, 0x00, 0x10], |c| c.reg_x = 1), 4);
+    }
+
+    #[test]
+    fn lda_absolute_x_page_crossed() {
+        // LDA $10FF,X with X = 1 lands on $1100
+        assert_eq!(cycles_for(&[0xbd, 0xff, 0x10], |c| c.reg_x = 1), 5);
+    }
+
+    #[test]
+    fn sta_absolute_x_page_crossed_has_no_penalty() {
+        assert_eq!(cycles_for(&[0x9d, 0xff, 0x10], |c| c.reg_x = 1), 5);
+    }
+
+    #[test]
+    fn bpl_not_taken() {
+        assert_eq!(cycles_for(&[0x10, 0x02], |c| c.set_negative(true)), 2);
+    }
+
+    #[test]
+    fn bpl_taken_same_page() {
+        assert_eq!(cycles_for(&[0x10, 0x02], |_| {}), 3);
+    }
+
+    #[test]
+    fn bpl_taken_page_crossed() {
+        // From $0602, branching back 3 lands on $05FF
+        assert_eq!(cycles_for(&[0x10, 0xfd], |_| {}), 4);
+    }
+
+    #[test]
+    fn reset_cycles_are_not_counted_as_a_step() {
+        let mut bus = Bus::new();
+        bus.load(0xFFFC, &[0x00, 0x06]);
+        bus.load(0x0600, &[0xd8]); // CLD
+        let mut cpu = CPU::new();
+        cpu.reset(&bus);
+        cpu.step(1, &mut bus);
+        assert_eq!(cpu.pc, 0x0601);
+        assert_eq!(cpu.total_cycles, 7 + 2);
     }
 }

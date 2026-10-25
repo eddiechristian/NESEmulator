@@ -1,5 +1,5 @@
-use crate::cpu::IMPLEMENTED;
 use crate::bus::Bus;
+use crate::cpu::IMPLEMENTED;
 use crate::opcode::OPCODES_MAP;
 
 // Addressing modes as they appear in assembly syntax. Separate from cpu::AddressingMode
@@ -27,6 +27,24 @@ impl Mode {
             Mode::Implied | Mode::Accumulator => 1,
             Mode::Absolute | Mode::AbsoluteX | Mode::AbsoluteY | Mode::Indirect => 3,
             _ => 2,
+        }
+    }
+
+    // olcNES's three-letter names. olc has no separate accumulator mode, so ASL A etc. show as IMP
+    fn abbr(self) -> &'static str {
+        match self {
+            Mode::Implied | Mode::Accumulator => "IMP",
+            Mode::Immediate => "IMM",
+            Mode::ZeroPage => "ZP0",
+            Mode::ZeroPageX => "ZPX",
+            Mode::ZeroPageY => "ZPY",
+            Mode::Absolute => "ABS",
+            Mode::AbsoluteX => "ABX",
+            Mode::AbsoluteY => "ABY",
+            Mode::Indirect => "IND",
+            Mode::IndirectX => "IZX",
+            Mode::IndirectY => "IZY",
+            Mode::Relative => "REL",
         }
     }
 }
@@ -110,45 +128,89 @@ fn format_operand(mode: Mode, addr: u16, lo: u8, hi: u8) -> String {
         Mode::IndirectX => format!("(${:02X},X)", lo),
         Mode::IndirectY => format!("(${:02X}),Y", lo),
         // Show the branch target rather than the raw signed offset
-        Mode::Relative => format!("${:04X}", addr.wrapping_add(2).wrapping_add(lo as i8 as u16)),
+        Mode::Relative => format!(
+            "${:04X}",
+            addr.wrapping_add(2).wrapping_add(lo as i8 as u16)
+        ),
     }
 }
 
-// Linear-sweep disassembly of `count` instructions starting at `start`, marking which
-// ones the CPU can execute. Doesn't follow jumps, so data mixed into code will show up as garbage
-pub fn disassemble(bus: &Bus, start: u16, count: usize) {
-    let mut addr = start;
-    let mut first_missing = true;
+// One decoded instruction, for callers that want to lay out the listing themselves
+pub struct Instruction {
+    pub addr: u16,
+    pub len: u16,
+    pub bytes: String,      // raw bytes in hex, e.g. "AD 02 20"
+    pub text: String,       // assembly, e.g. "LDA $2002"
+    pub mode: &'static str, // olcNES mode abbreviation, e.g. "ABS"
+    // Needs both an opcode table entry and a handler in CPU::execute
+    pub implemented: bool,
+}
 
-    for _ in 0..count {
-        let read = |offset: u16| bus.read(addr.wrapping_add(offset));
-        let code = read(0);
+pub fn decode(bus: &Bus, addr: u16) -> Instruction {
+    let read = |offset: u16| bus.read(addr.wrapping_add(offset));
+    let code = read(0);
 
-        let (len, text, implemented) = match lookup(code) {
-            Some((name, mode)) => {
-                let operand = format_operand(mode, addr, read(1), read(2));
-                // Needs both an opcode table entry and a handler in CPU::step
-                let implemented = OPCODES_MAP.contains_key(&code) && IMPLEMENTED.contains(&name);
-                (mode.len(), format!("{} {}", name, operand), implemented)
-            }
-            None => (1, format!(".db ${:02X}", code), false),
-        };
+    let (len, text, mode, implemented) = match lookup(code) {
+        Some((name, mode)) => {
+            let operand = format_operand(mode, addr, read(1), read(2));
+            let implemented = OPCODES_MAP.contains_key(&code) && IMPLEMENTED.contains(&name);
+            (
+                mode.len(),
+                format!("{} {}", name, operand).trim_end().to_string(),
+                mode.abbr(),
+                implemented,
+            )
+        }
+        None => (1, format!(".db ${:02X}", code), "???", false),
+    };
 
-        let bytes = (0..len)
-            .map(|i| format!("{:02X}", read(i)))
-            .collect::<Vec<_>>()
-            .join(" ");
+    let bytes = (0..len)
+        .map(|i| format!("{:02X}", read(i)))
+        .collect::<Vec<_>>()
+        .join(" ");
 
-        let status = if implemented {
-            "✓ implemented"
-        } else if first_missing {
-            first_missing = false;
-            "✗ missing  <- next to implement"
-        } else {
-            "✗ missing"
-        };
-
-        println!("{:04X}  {:<8}  {:<13} {}", addr, bytes, text.trim_end(), status);
-        addr = addr.wrapping_add(len);
+    Instruction {
+        addr,
+        len,
+        bytes,
+        text,
+        mode,
+        implemented,
     }
+}
+
+// Linear-sweep decode of `count` instructions starting at `start`
+pub fn decode_range(bus: &Bus, start: u16, count: usize) -> Vec<Instruction> {
+    let mut out = Vec::with_capacity(count);
+    let mut addr = start;
+    for _ in 0..count {
+        let ins = decode(bus, addr);
+        addr = addr.wrapping_add(ins.len);
+        out.push(ins);
+    }
+    out
+}
+
+// Linear-sweep disassembly of `count` instructions starting at `start`, marking which
+// ones the CPU can execute. Returns one formatted line per instruction.
+// Doesn't follow jumps, so data mixed into code will show up as garbage
+pub fn disassemble(bus: &Bus, start: u16, count: usize) -> Vec<String> {
+    let mut first_missing = true;
+    decode_range(bus, start, count)
+        .into_iter()
+        .map(|ins| {
+            let status = if ins.implemented {
+                "✓ implemented"
+            } else if first_missing {
+                first_missing = false;
+                "✗ missing  <- next to implement"
+            } else {
+                "✗ missing"
+            };
+            format!(
+                "{:04X}  {:<8}  {:<13} {}  {}",
+                ins.addr, ins.bytes, ins.text, ins.mode, status
+            )
+        })
+        .collect()
 }

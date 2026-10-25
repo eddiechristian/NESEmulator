@@ -9,25 +9,29 @@ An early-stage NES emulator in Rust (edition 2024). Only a handful of 6502 CPU i
 ## Commands
 
 - Build: `cargo build`
-- Run the built-in dummy program (loaded at `$0600`): `cargo run`
-- Run against a ROM: `cargo run -- DonkeyKong.nes`. Other test ROMs are in the repo root as `.zip` files and must be extracted first. ROMs (`*.nes`, `*.zip`) are gitignored and kept local only.
+- Open the CPU debugger on the built-in dummy program (loaded at `$0600`): `cargo run`
+- Open the CPU debugger on a ROM: `cargo run -- DonkeyKong.nes`. Other test ROMs are in the repo root as `.zip` files and must be extracted first. ROMs (`*.nes`, `*.zip`) are gitignored and kept local only.
 - Disassemble: `cargo run -- --disasm <rom.nes> [count] [addr]` lists `count` instructions (default 16) from hex `addr` (default: reset vector) and marks which ones are implemented.
-- Tests: `cargo test` (there are no tests yet; run a single test with `cargo test <name>`)
+- Tests: `cargo test` (cycle-timing tests live in `cpu.rs`; run a single test with `cargo test <name>`)
 - Lint/format: `cargo clippy`, `cargo fmt`
 
-`main` currently runs a fixed number of steps (`cpu.step(5, ...)`), so change that count to execute more instructions.
+Running (without `--disasm`) opens the debugger window: SPACE steps one instruction, R resets, ESC quits. The CPU's debug trace still prints to stdout as you step.
 
 ## Architecture
 
 - **`bus.rs`**: `Bus` holds a flat 64KB `ram` array and is the only way components touch memory: `read(addr)`, `write(addr, data)`, plus `load` (copy a slice in) and `print_range` (hex dump). There is no RAM mirroring, memory-mapped I/O, or mapper indirection yet; those belong in `read`/`write`. `main` fakes the PPU by writing `$80` to `$2002` so vblank-wait loops exit.
-- **`opcode.rs`**: a `lazy_static` table (`CPU_OPS_CODES`) of `OpCode { code, mnemonic, len, cycles, mode }`, indexed by `OPCODES_MAP: HashMap<u8, &OpCode>`. Every new instruction needs an entry here. Unknown opcodes panic in `step`.
-- **`cpu.rs`**: `CPU::step(n, bus)` fetches each opcode, looks it up in `OPCODES_MAP`, and dispatches by matching on the **mnemonic string**. New handlers must also be added to `IMPLEMENTED`, which the disassembler uses.
-  - `operand_address(mode, bus)` resolves all addressing modes to a `u16` effective address (Immediate is PC+1; zero page indexing and `(zp),Y`/`(zp,X)` pointers wrap within page zero).
+- **`opcode.rs`**: a `lazy_static` table (`CPU_OPS_CODES`) of `OpCode { code, mnemonic, len, cycles, mode }` (`cycles` = base cost), indexed by `OPCODES_MAP: HashMap<u8, &OpCode>`. Every new instruction needs an entry here. Unknown opcodes panic in `execute`.
+- **`cpu.rs`**: `execute(bus)` fetches one opcode, looks it up in `OPCODES_MAP`, and dispatches by matching on the **mnemonic string**. New handlers must also be added to `IMPLEMENTED`, which the disassembler uses.
+  - Timing follows olcNES: `clock(bus)` runs a whole instruction on its first cycle, then counts down `cycles`; `complete()` is true when it reaches 0. `step(n, bus)` clocks through `n` whole instructions. `total_cycles` counts since power-on, and `reset()` adds the 7-cycle reset sequence.
+  - An instruction's cost is `OpCode.cycles` plus whatever its handler returns: indexed reads (`lda`/`ldx`) return 1 when `operand_address` reports a page crossing, and `branch` returns +1 if taken, +1 more if the target is on another page. Stores never pay the page penalty (their table cost is already worst-case).
+  - `operand_address(mode, bus)` resolves all addressing modes to a `(u16, page_crossed)` effective address (Immediate is PC+1; zero page indexing and `(zp),Y`/`(zp,X)` pointers wrap within page zero).
   - PC advance rule: after a handler runs, PC moves forward by `opcode.len` *only if the handler left PC unchanged*. Jumps/branches set PC themselves, but a jump to its own address would be mishandled by this rule.
   - Stack is page one (`$0100–$01FF`) and grows downward. JSR pushes PC+2 (high byte first) and RTS pops and adds 1, which matches real 6502 behavior.
   - `reset()` loads PC from the reset vector at `$FFFC/$FFFD`. `CPU::new()` defaults PC to `$0600` for the dummy program.
   - Handlers print a lot of debug trace (operands, memory before/after, stack dumps, register state via the `{:#X}` `UpperHex` impl).
-- **`disasm.rs`**: linear-sweep disassembler behind `--disasm`. Doesn't follow jumps.
+- **`disasm.rs`**: linear-sweep disassembler. `decode`/`decode_range` return `Instruction` structs (used by the debugger); `disassemble` formats them as text lines for `--disasm`. Modes use olcNES abbreviations (`IMM`, `ABS`, `REL`, ...). Doesn't follow jumps.
+- **`debugger.rs`**: the olcNES Part#2 debug screen in a `pixels` + `winit` window (680x480 at 2x): RAM page `$0000`, the RAM page containing PC, registers/flags/cycles, and the next 25 instructions from PC (current in cyan, unimplemented in red). Stepping is refused with a message if the next instruction isn't implemented, instead of panicking.
+- **`canvas.rs`** / **`font.rs`**: frame-buffer drawing (`clear`, `draw`, `draw_string`) and the olcPixelGameEngine 8x8 font, ported from `pixels_test`.
 - **`rom.rs`**: parses iNES files (header, optional trainer, PRG, CHR, mapper number). `load_into` copies PRG ROM to `$8000` and mirrors a 16KB PRG into `$C000` so the vectors line up. CHR ROM is parsed but not used yet. Only mapper-0 (NROM) layouts load correctly.
 
 ## Other directories
